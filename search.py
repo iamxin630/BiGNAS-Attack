@@ -104,6 +104,8 @@ if __name__ == "__main__":
     parser.add_argument("--hpo-lr", type=float, default=0.01)
     parser.add_argument("--descent-step", type=int, default=10)
     parser.add_argument("--meta-op", type=str, default="gat")
+    # 新增 source_item_top_ratio 超參數
+    parser.add_argument('--source-item-top-ratio', type=float, default=0.1)
 
     args = parser.parse_args()
     search(args)
