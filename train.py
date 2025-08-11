@@ -389,7 +389,7 @@ def train(model, perceptor, data, args):
     mask_A = target_train_edge_index[1] == target_item_id
     group_A_raw_user_ids = target_train_edge_index[0][mask_A].cpu()
     print(f"Group A raw user IDs count: {len(group_A_raw_user_ids)}")
-    print(f"Group A raw user IDs sample: {group_A_raw_user_ids[:20].tolist()}")  # 印前20個，可依需求調整
+    print(f"Group A raw user IDs sample: {group_A_raw_user_ids.tolist()}") 
 
 
     # 5. 篩選 Group A，只保留在 overlap_users 內的有效 raw user id
@@ -458,23 +458,10 @@ def train(model, perceptor, data, args):
     
     ###################################
 
-    # target_train_set = Dataset(
-    #     target_train_link.to("cpu"),
-    #     target_train_label.to("cpu"),
-    # )
-    # target_train_loader = DataLoader(
-    #     target_train_set,
-    #     batch_size=args.batch_size,
-    #     shuffle=True,
-    #     num_workers=args.num_workers,
-    #     collate_fn=target_train_set.collate_fn,
-    # )
     target_train_set = Dataset(
-        target_train_edge_index.cpu(),
-        target_train_label.cpu(),
+        target_train_link.to("cpu"),
+        target_train_label.to("cpu"),
     )
-    print(f"Dataset長度: {len(target_train_set)}")#32221
-
     target_train_loader = DataLoader(
         target_train_set,
         batch_size=args.batch_size,
@@ -726,12 +713,12 @@ def train(model, perceptor, data, args):
     )
     logging.info(f"Test AUC: {test_auc:.4f}")
     wandb.log({"Test AUC": test_auc})
-    # evaluate_multiple_topk(
-    #     model=model,
-    #     data=data,
-    #     source_edge_index=source_edge_index,
-    #     target_edge_index=target_train_edge_index,
-    #     cold_item_set={cold_item_id},   # 注意這邊是 set，不是 cold_item_id=
-    #     device=device
-    # )
+    evaluate_multiple_topk(
+        model=model,
+        data=data,
+        source_edge_index=source_edge_index,
+        target_edge_index=target_train_edge_index,
+        cold_item_set={cold_item_id},   # 注意這邊是 set，不是 cold_item_id=
+        device=device
+    )
 

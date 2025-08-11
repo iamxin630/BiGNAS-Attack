@@ -247,8 +247,8 @@ class Dataset(BaseDataset):
         self.label = label
 
     def __len__(self):
-        return len(self.label)
-        #return self.link.shape[1]  # 確保這裡用的是新增邊後的 link 長度
+        #return len(self.label)
+        return self.link.shape[1]  # 確保這裡用的是新增邊後的 link 長度
 
     def __getitem__(self, index):
         link = self.link[:, index]
