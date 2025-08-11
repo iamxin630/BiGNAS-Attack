@@ -1,3 +1,4 @@
+###剪邊攻擊
 import logging
 
 import torch
@@ -255,7 +256,7 @@ def evaluate_er_hit_ratio(
 
 
 def evaluate_multiple_topk(model, data, source_edge_index, target_edge_index, cold_item_set, device):
-    topk_list = [10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100]
+    topk_list = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
     print("\n📊 Evaluation for multiple top-K values:")
     for k in topk_list:
         hr = evaluate_hit_ratio(
