@@ -2,6 +2,7 @@ import logging
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
@@ -149,6 +150,10 @@ def find_cold_item_strict(data, target_train_edge_index, target_test_edge_index)
     train_edges = target_train_edge_index.cpu().numpy()
     test_edges = target_test_edge_index.cpu().numpy()
     overlap_users = set(data.raw_overlap_users.cpu().numpy())  # ⬅️ overlap user list
+    overlap_users = set(data.raw_overlap_users.cpu().numpy())  # ⬅️ overlap user list
+    print(f"Overlap users count: {len(overlap_users)}")
+    print(f"Overlap users sample: {list(overlap_users)[:10]}")  # 印前10個用戶ID
+
 
     # Step 1: 統計 overlap user 在 test set 中點擊的 item 次數
     test_user, test_item = test_edges
@@ -279,6 +284,62 @@ def evaluate_multiple_topk(model, data, source_edge_index, target_edge_index, co
             device=device
         )
 
+def get_group_A_user_ids(edge_index, target_item_id):
+    """
+    從 target domain 的 edge_index ([2, num_edges]) 中找出買過 target_item_id 的 user ids
+    """
+    users = edge_index[0]
+    items = edge_index[1]
+    mask = items == target_item_id
+    return users[mask].unique()
+
+
+def find_hard_users(source_user_embs, group_A_emb_idx, top_ratio=0.1):
+    """
+    根據 source domain 用戶 embedding，找出 group B 中與 group A 距離最大 top_ratio 的 hard users。
+    Args:
+        source_user_embs: Tensor, shape [num_users, emb_dim]
+        group_A_emb_idx: LongTensor，group A 用戶 embedding index
+        top_ratio: float，取最大距離 top 多少比例
+    Returns:
+        hard_user_emb_idx: LongTensor，group B 中被挑選為 hard user 的 embedding index
+    """
+    num_users = source_user_embs.size(0)
+    device = source_user_embs.device
+    all_user_ids = torch.arange(num_users, device=device)
+
+    # Group B 是所有用戶扣掉 Group A
+    group_B_mask = ~torch.isin(all_user_ids, group_A_emb_idx.to(device))
+    group_B_user_ids = all_user_ids[group_B_mask]  # embedding idx
+
+    # L2 正規化 embedding
+    group_A_embs = F.normalize(source_user_embs[group_A_emb_idx], p=2, dim=1)
+    group_B_embs = F.normalize(source_user_embs[group_B_user_ids], p=2, dim=1)
+
+    # 計算 cosine 相似度矩陣
+    cosine_sim = torch.matmul(group_B_embs, group_A_embs.T)
+    cosine_dist = 1 - cosine_sim  # 距離 = 1 - 相似度
+
+    # 印出部分 cosine similarity 細節供檢視
+    logging.info(f"Cosine similarity matrix shape: {cosine_sim.shape}")
+    logging.info(f"Cosine similarity sample (first 5 Group B users vs first 5 Group A users):\n{cosine_sim[:5, :5]}")
+
+    # 每個 Group B 用戶取距離最小值 (與最近的 Group A 用戶距離)
+    min_dist_per_B_user, min_idx = torch.min(cosine_dist, dim=1)
+    max_sim_per_B_user = cosine_sim[torch.arange(len(min_idx), device=device), min_idx] #這沒用
+    logging.info(f"Sample minimal distances: {min_dist_per_B_user.tolist()}")
+    logging.info(f"Sample maximal cosine similarities (closest user): {max_sim_per_B_user[:10].tolist()}") #這沒用
+
+    # 閾值取最大 top_ratio 的距離
+    threshold = torch.quantile(min_dist_per_B_user, 1 - top_ratio)
+    hard_mask = min_dist_per_B_user >= threshold
+    hard_user_emb_idx = group_B_user_ids[hard_mask]
+
+    logging.info(f"Distance threshold for top {top_ratio*100}% hard users: {threshold:.4f}")
+    logging.info(f"Total group B users: {len(group_B_user_ids)}, hard users count: {len(hard_user_emb_idx)}")
+    logging.info(f"Sample hard user embedding idx: {hard_user_emb_idx[:10].tolist()}")
+
+    return hard_user_emb_idx
 
 
 
@@ -309,11 +370,111 @@ def train(model, perceptor, data, args):
     logging.info(f"Train set size: {train_set_size}")
     logging.info(f"Valid set size: {val_set_size}")
     logging.info(f"Test set size: {test_set_size}")
+    
+    # ######################################
+    
 
+    # 1. 先從 target domain 邊取得所有原始用戶 ID（不重複）
+    all_raw_user_ids = target_train_edge_index[0].unique().cpu()
+
+    # 2. 取得 raw_overlap_users：模型embedding對應的用戶原始ID集合（可用於embedding索引）
+    overlap_users = data.raw_overlap_users.cpu()  # Tensor，長度2809，例如
+    overlap_users_set = set(overlap_users.numpy())
+
+    # 3. 建立映射表：raw user id -> embedding 索引（0~2808）
+    user_id_to_emb_idx = {uid.item(): idx for idx, uid in enumerate(overlap_users)}
+
+    # 4. 找 Group A 原始用戶：買過目標商品的用戶 raw ID
+    target_item_id = 3080
+    mask_A = target_train_edge_index[1] == target_item_id
+    group_A_raw_user_ids = target_train_edge_index[0][mask_A].cpu()
+    print(f"Group A raw user IDs count: {len(group_A_raw_user_ids)}")
+    print(f"Group A raw user IDs sample: {group_A_raw_user_ids[:20].tolist()}")  # 印前20個，可依需求調整
+
+
+    # 5. 篩選 Group A，只保留在 overlap_users 內的有效 raw user id
+    group_A_valid_mask = torch.tensor([uid.item() in overlap_users_set for uid in group_A_raw_user_ids])
+    group_A_raw_user_ids_valid = group_A_raw_user_ids[group_A_valid_mask]
+
+    # 6. 映射 Group A 原始用戶 ID 到 embedding 索引
+    group_A_user_emb_idx = torch.tensor([user_id_to_emb_idx[uid.item()] for uid in group_A_raw_user_ids_valid])
+
+    # 7. 對所有 raw 用戶，篩選只包含 overlap_users 的有效用戶，再映射成 embedding 索引
+    valid_all_mask = torch.tensor([uid.item() in overlap_users_set for uid in all_raw_user_ids])
+    valid_all_raw_user_ids = all_raw_user_ids[valid_all_mask]
+    all_user_emb_idx = torch.tensor([user_id_to_emb_idx[uid.item()] for uid in valid_all_raw_user_ids])
+
+    # 8. Group B 即所有有效用戶剔除 Group A，用 embedding 索引形式表示
+    group_B_mask = ~torch.isin(all_user_emb_idx, group_A_user_emb_idx)
+    group_B_user_emb_idx = all_user_emb_idx[group_B_mask]
+
+    # 列印資訊確認
+    logging.info(f"Group A user count: {len(group_A_user_emb_idx)}")
+    logging.info(f"Group B user count: {len(group_B_user_emb_idx)}")
+    # logging.info(f"Group A sample embedding idx: {group_A_user_emb_idx[:10].tolist()}")
+    # logging.info(f"Group B sample embedding idx: {group_B_user_emb_idx[:10].tolist()}")
+
+    # 9. 你可以用 group_A_user_emb_idx 和 group_B_user_emb_idx 這兩組embedding索引去索引 model.user_embedding.weight 做後續計算
+    source_user_embs = model.user_embedding.weight  # shape [num_users, emb_dim]
+
+    # 計算距離與找 hard user 等後續步驟...
+    # 找出hard user
+    hard_user_ids = find_hard_users(source_user_embs, group_A_user_emb_idx.to(source_user_embs.device), top_ratio=0.1)
+    
+    #emb_userID to org_userID
+    emb_idx_to_user_id = {v: k for k, v in user_id_to_emb_idx.items()}
+    hard_user_raw_ids = [emb_idx_to_user_id[idx.item()] for idx in hard_user_ids.cpu()]
+    hard_user_raw_ids.sort()
+    print(f"用戶原始ID（排序後）：{hard_user_raw_ids}")
+
+
+    print(f"找到 hard user 數量: {len(hard_user_ids)}")
+    #print(f"示例 hard user id: {hard_user_ids.tolist()}")#這是emb_userID
+    
+    ###################################
+    
+    # 確保 device 一致
+    device = target_train_edge_index.device
+
+    # 1. 將 hard user 原始ID轉 tensor
+    hard_user_raw_ids_tensor = torch.tensor(hard_user_raw_ids, dtype=torch.long, device=device)
+
+    # 2. 建立目標item id tensor (全填 target_item_id)
+    target_item_ids_tensor = torch.full_like(hard_user_raw_ids_tensor, fill_value=target_item_id)
+
+    # 3. 將用戶和商品合併成邊索引矩陣
+    new_edges = torch.stack([hard_user_raw_ids_tensor, target_item_ids_tensor], dim=0)
+
+    # 4. 合併新邊到 target train edge index
+    target_train_edge_index = torch.cat([target_train_edge_index, new_edges], dim=1)
+
+    # 5. 同步合併標籤 (全部1 = 正例)
+    new_labels = torch.ones(hard_user_raw_ids_tensor.size(0), dtype=target_train_label.dtype, device=device)
+    target_train_label = torch.cat([target_train_label, new_labels], dim=0)
+
+    # 在這裡加上你要印的確認資訊
+    print(f"原始train edge count: {target_train_edge_index.shape[1] - new_edges.shape[1]}")  # 新增前邊數63882
+    print(f"新增後train edge count: {target_train_edge_index.shape[1]}")  # 新增後邊數64162
+    
+    ###################################
+
+    # target_train_set = Dataset(
+    #     target_train_link.to("cpu"),
+    #     target_train_label.to("cpu"),
+    # )
+    # target_train_loader = DataLoader(
+    #     target_train_set,
+    #     batch_size=args.batch_size,
+    #     shuffle=True,
+    #     num_workers=args.num_workers,
+    #     collate_fn=target_train_set.collate_fn,
+    # )
     target_train_set = Dataset(
-        target_train_link.to("cpu"),
-        target_train_label.to("cpu"),
+        target_train_edge_index.cpu(),
+        target_train_label.cpu(),
     )
+    print(f"Dataset長度: {len(target_train_set)}")#32221
+
     target_train_loader = DataLoader(
         target_train_set,
         batch_size=args.batch_size,
@@ -540,8 +701,8 @@ def train(model, perceptor, data, args):
         num_candidates=99,
         device=device,
     )
-    # cold_item_id = find_cold_item_strict(data, target_train_edge_index, target_test_edge_index)
-    cold_item_id =17069
+    #cold_item_id = find_cold_item_strict(data, target_train_edge_index, target_test_edge_index)
+    cold_item_id = 3080
     if cold_item_id is not None:
         evaluate_er_hit_ratio(
             model=model,
@@ -565,11 +726,12 @@ def train(model, perceptor, data, args):
     )
     logging.info(f"Test AUC: {test_auc:.4f}")
     wandb.log({"Test AUC": test_auc})
-    evaluate_multiple_topk(
-        model=model,
-        data=data,
-        source_edge_index=source_edge_index,
-        target_edge_index=target_train_edge_index,
-        cold_item_set={cold_item_id},   # 注意這邊是 set，不是 cold_item_id=
-        device=device
-    )
+    # evaluate_multiple_topk(
+    #     model=model,
+    #     data=data,
+    #     source_edge_index=source_edge_index,
+    #     target_edge_index=target_train_edge_index,
+    #     cold_item_set={cold_item_id},   # 注意這邊是 set，不是 cold_item_id=
+    #     device=device
+    # )
+
