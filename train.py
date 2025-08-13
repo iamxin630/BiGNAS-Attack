@@ -1,4 +1,4 @@
-###剪邊攻擊
+###這是方法二###
 import logging
 
 import torch
