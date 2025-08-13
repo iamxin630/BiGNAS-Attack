@@ -310,6 +310,7 @@ def find_hard_users(source_user_embs, group_A_emb_idx, top_ratio=0.1):
     # Group B 是所有用戶扣掉 Group A
     group_B_mask = ~torch.isin(all_user_ids, group_A_emb_idx.to(device))
     group_B_user_ids = all_user_ids[group_B_mask]  # embedding idx
+    
 
     # L2 正規化 embedding，避免距離計算過程中因大小不同導致誤差，適合計算 cosine 相似度
     group_A_embs = F.normalize(source_user_embs[group_A_emb_idx], p=2, dim=1)
@@ -338,7 +339,7 @@ def find_hard_users(source_user_embs, group_A_emb_idx, top_ratio=0.1):
 
     logging.info(f"Distance threshold for top {top_ratio*100}% hard users: {threshold:.4f}")
     logging.info(f"Total group B users: {len(group_B_user_ids)}, hard users count: {len(hard_user_emb_idx)}")
-    #logging.info(f"Sample hard user embedding idx: {hard_user_emb_idx[:10].tolist()}")
+    #logging.info(f"Sample hard user embedding idx: {hard_user_emb_idx.tolist()}")
 
     return hard_user_emb_idx #被選為 hard user 的 Group B 用戶 embedding 索引
 
@@ -461,16 +462,16 @@ def train(model, perceptor, data, args):
     # 1. 將 hard user 原始ID轉 tensor
     hard_user_raw_ids_tensor = torch.tensor(hard_user_raw_ids, dtype=torch.long, device=device)
 
-    # 2. 建立目標item id tensor (全填 target_item_id)
+    # # # 2. 建立目標item id tensor (全填 target_item_id)
     target_item_ids_tensor = torch.full_like(hard_user_raw_ids_tensor, fill_value=target_item_id)
 
-    # 3. 將用戶和商品合併成邊索引矩陣
+    # # # 3. 將用戶和商品合併成邊索引矩陣
     new_edges = torch.stack([hard_user_raw_ids_tensor, target_item_ids_tensor], dim=0)
 
-    # 4. 合併新邊到 target train edge index
+    # # # 4. 合併新邊到 target train edge index
     target_train_edge_index = torch.cat([target_train_edge_index, new_edges], dim=1)
 
-    # 5. 同步合併標籤 (全部1 = 正例)
+    # # # 5. 同步合併標籤 (全部1 = 正例)
     new_labels = torch.ones(hard_user_raw_ids_tensor.size(0), dtype=target_train_label.dtype, device=device)
     target_train_label = torch.cat([target_train_label, new_labels], dim=0)
     
