@@ -762,4 +762,3 @@ def train(model, perceptor, data, args):
         cold_item_set={cold_item_id},   # 注意這邊是 set，不是 cold_item_id=
         device=device
     )
-
