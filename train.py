@@ -1,8 +1,8 @@
-###這是方法二####
 import logging
-
+from collections import Counter
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
@@ -145,11 +145,14 @@ def count_cold_item_occurrences(data, cold_item_set):
 
 def find_cold_item_strict(data, target_train_edge_index, target_test_edge_index):
     import numpy as np
-    from collections import Counter
+    
 
     train_edges = target_train_edge_index.cpu().numpy()
     test_edges = target_test_edge_index.cpu().numpy()
     overlap_users = set(data.raw_overlap_users.cpu().numpy())  # ⬅️ overlap user list
+    print(f"Overlap users count: {len(overlap_users)}")
+    print(f"Overlap users sample: {list(overlap_users)[:10]}")  # 印前10個用戶ID
+
 
     # Step 1: 統計 overlap user 在 test set 中點擊的 item 次數
     test_user, test_item = test_edges
@@ -256,7 +259,7 @@ def evaluate_er_hit_ratio(
 
 
 def evaluate_multiple_topk(model, data, source_edge_index, target_edge_index, cold_item_set, device):
-    topk_list = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    topk_list = [10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100]
     print("\n📊 Evaluation for multiple top-K values:")
     for k in topk_list:
         hr = evaluate_hit_ratio(
@@ -280,7 +283,189 @@ def evaluate_multiple_topk(model, data, source_edge_index, target_edge_index, co
             device=device
         )
 
+def get_group_A_user_ids(edge_index, target_item_id):
+    """
+    從 target domain 的 edge_index ([2, num_edges]) 中找出買過 target_item_id 的 user ids
+    """
+    users = edge_index[0]
+    items = edge_index[1]
+    mask = items == target_item_id
+    return users[mask].unique()
 
+
+def find_hard_users(source_user_embs, group_A_emb_idx, top_ratio=0.1):
+    """
+    根據 source domain 用戶 embedding，找出 group B 中與 group A 距離最大 top_ratio 的 hard users。
+    Args:
+        source_user_embs: Tensor, shape [num_users, emb_dim]
+        group_A_emb_idx: LongTensor，group A 用戶 embedding index
+        top_ratio: float，取最大距離 top 多少比例
+    Returns:
+        hard_user_emb_idx: LongTensor，group B 中被挑選為 hard user 的 embedding index
+    """
+    num_users = source_user_embs.size(0)
+    device = source_user_embs.device
+    all_user_ids = torch.arange(num_users, device=device) #構建所有用戶的標準索引張量 [0, 1, ..., num_users-1]
+
+    # Group B 是所有用戶扣掉 Group A
+    group_B_mask = ~torch.isin(all_user_ids, group_A_emb_idx.to(device))
+    group_B_user_ids = all_user_ids[group_B_mask]  # embedding idx
+    
+
+    # L2 正規化 embedding，避免距離計算過程中因大小不同導致誤差，適合計算 cosine 相似度
+    group_A_embs = F.normalize(source_user_embs[group_A_emb_idx], p=2, dim=1)
+    group_B_embs = F.normalize(source_user_embs[group_B_user_ids], p=2, dim=1)
+
+    # 計算 cosine 相似度矩陣
+    cosine_sim = torch.matmul(group_B_embs, group_A_embs.T) #shape: [len(group_B), len(group_A)]
+    # 轉換為距離：距離設為 1 - cosine similarity
+    cosine_dist = 1 - cosine_sim  # 距離越大表示用戶行為越不相似
+
+    # 印出部分 cosine similarity 細節供檢視
+    #logging.info(f"Cosine similarity matrix shape: {cosine_sim.shape}")
+    #logging.info(f"Cosine similarity sample (first 5 Group B users vs first 5 Group A users):\n{cosine_sim[:5, :5]}")
+
+    # 每個 Group B 用戶取距離最小值 (與最近的 Group A 用戶距離)
+    min_dist_per_B_user, min_idx = torch.min(cosine_dist, dim=1)
+    max_sim_per_B_user = cosine_sim[torch.arange(len(min_idx), device=device), min_idx] #這沒用
+    #logging.info(f"Sample minimal distances: {min_dist_per_B_user.tolist()}")
+    #logging.info(f"Sample maximal cosine similarities (closest user): {max_sim_per_B_user[:10].tolist()}") #這沒用
+
+    # 閾值取最大 top_ratio 的距離
+    threshold = torch.quantile(min_dist_per_B_user, 1 - top_ratio)
+    # 篩選距離大於等於閾值的 Group B 用戶作為 hard users
+    hard_mask = min_dist_per_B_user >= threshold
+    hard_user_emb_idx = group_B_user_ids[hard_mask]
+
+    logging.info(f"Distance threshold for top {top_ratio*100}% hard users: {threshold:.4f}")
+    logging.info(f"Total group B users: {len(group_B_user_ids)}, hard users count: {len(hard_user_emb_idx)}")
+    #logging.info(f"Sample hard user embedding idx: {hard_user_emb_idx.tolist()}")
+
+    return hard_user_emb_idx #被選為 hard user 的 Group B 用戶 embedding 索引
+
+def find_top_diff_items_by_percentile(group_A_raw_user_ids, group_B_raw_user_ids, source_edge_index, top_ratio=0.1):
+    """
+    找出 group A 和 group B 買的商品，挑差距在前 top_ratio (前10%等)的商品，並印出購買次數與差距
+
+    Args:
+        group_A_raw_user_ids (list of int)
+        group_B_raw_user_ids (list of int)
+        source_edge_index (Tensor [2, E])
+        top_ratio (float): 取差距最大的前多少比例商品，範圍0~1
+
+    Returns:
+        List of 商品 id（差距達到 top_ratio 閾值的商品）
+    """
+    from collections import Counter
+    import torch
+
+    source_users = source_edge_index[0].tolist()
+    source_items = source_edge_index[1].tolist()
+
+    # group A 購買行為統計
+    group_A_items = []
+    set_A = set(group_A_raw_user_ids)
+    for u, i in zip(source_users, source_items):
+        if u in set_A:
+            group_A_items.append(i)
+    counter_A = Counter(group_A_items)
+
+    # group B 購買行為統計
+    group_B_items = []
+    set_B = set(group_B_raw_user_ids)
+    for u, i in zip(source_users, source_items):
+        if u in set_B:
+            group_B_items.append(i)
+    counter_B = Counter(group_B_items)
+
+    # 所有商品集合
+    all_items = set(counter_A.keys()).union(set(counter_B.keys()))
+
+    # 計算差距 = 絕對購買次數差距
+    diff_list = []
+    for item in all_items:
+        cnt_A = counter_A.get(item, 0)
+        cnt_B = counter_B.get(item, 0)
+        diff = abs(cnt_A - cnt_B)
+        diff_list.append((item, diff, cnt_A, cnt_B))
+
+    # 先取出所有差距值，用 torch tensor 計算 quantile
+    diffs = torch.tensor([d[1] for d in diff_list], dtype=torch.float)
+    threshold = torch.quantile(diffs, 1 - top_ratio).item()
+
+    # 篩選差距 >= 閾值的商品
+    filtered = [x for x in diff_list if x[1] >= threshold]
+
+    # 排序，方便印出
+    filtered.sort(key=lambda x: x[1], reverse=True)
+
+    print(f"差距前 {top_ratio*100:.1f}% 的商品共 {len(filtered)} 個，差距閾值為 {threshold:.2f}")
+    print(f"{'商品ID':>8} | {'Group A 次數':>12} | {'Group B 次數':>12} | {'差距':>6}")
+    print("-" * 44)
+    for item, diff, cnt_A, cnt_B in filtered:
+        print(f"{item:8d} | {cnt_A:12d} | {cnt_B:12d} | {diff:6d}")
+
+    # 回傳篩選後的商品 ID 列表
+    return [item for item, _, _, _ in filtered]
+
+# def find_top_diff_items(group_A_raw_user_ids, group_B_raw_user_ids, source_edge_index, top_k=10):
+#     """
+#     找出 group A 和 group B 買的商品，挑差距最大的 top_k 商品，並印出購買次數與差距
+
+#     Args:
+#         group_A_raw_user_ids (list of int)
+#         group_B_raw_user_ids (list of int)
+#         source_edge_index (Tensor [2, E])
+#         top_k (int): 選前幾名差距最大的商品
+
+#     Returns:
+#         List of top_k 商品 id
+#     """
+#     from collections import Counter
+
+#     source_users = source_edge_index[0].tolist()
+#     source_items = source_edge_index[1].tolist()
+
+#     # group A 購買行為統計
+#     group_A_items = []
+#     set_A = set(group_A_raw_user_ids)
+#     for u, i in zip(source_users, source_items):
+#         if u in set_A:
+#             group_A_items.append(i)
+#     counter_A = Counter(group_A_items)
+
+#     # group B 購買行為統計
+#     group_B_items = []
+#     set_B = set(group_B_raw_user_ids)
+#     for u, i in zip(source_users, source_items):
+#         if u in set_B:
+#             group_B_items.append(i)
+#     counter_B = Counter(group_B_items)
+
+#     # 所有商品集合
+#     all_items = set(counter_A.keys()).union(set(counter_B.keys()))
+
+#     # 計算差距 = group_A_freq - group_B_freq (此處用絕對次數或相對頻率都可)
+#     diff_list = []
+#     for item in all_items:
+#         cnt_A = counter_A.get(item, 0)
+#         cnt_B = counter_B.get(item, 0)
+#         diff = abs(cnt_A - cnt_B)
+#         diff_list.append((item, diff, cnt_A, cnt_B))
+
+#     # 按差距排序（從大到小）
+#     diff_list.sort(key=lambda x: x[1], reverse=True)
+
+#     # 印出差距最大的前 top_k 筆商品與對應的購買次數
+#     print(f"Top {top_k} 商品的購買次數與差距：")
+#     print(f"{'商品ID':>8} | {'Group A 次數':>12} | {'Group B 次數':>12} | {'差距':>6}")
+#     print("-" * 44)
+#     for item, diff, cnt_A, cnt_B in diff_list[:top_k]:
+#         print(f"{item:8d} | {cnt_A:12d} | {cnt_B:12d} | {diff:6d}")
+
+#     top_diff_items = [item for item, diff, _, _ in diff_list[:top_k]]
+
+#     return top_diff_items
 
 
 def train(model, perceptor, data, args):
@@ -310,6 +495,132 @@ def train(model, perceptor, data, args):
     logging.info(f"Train set size: {train_set_size}")
     logging.info(f"Valid set size: {val_set_size}")
     logging.info(f"Test set size: {test_set_size}")
+    
+    #######################################
+
+    # 1. 先從 target domain 邊取得所有原始用戶 ID（不重複）
+    all_raw_user_ids = target_train_edge_index[0].unique().cpu()
+
+    # 2. 取得 raw_overlap_users：模型embedding對應的用戶原始ID集合（可用於embedding索引）
+    overlap_users = data.raw_overlap_users.cpu()  # Tensor，長度2809，例如
+    overlap_users_set = set(overlap_users.numpy())
+
+    # 3. 建立映射表：raw user id -> embedding 索引（0~2808）
+    user_id_to_emb_idx = {uid.item(): idx for idx, uid in enumerate(overlap_users)}
+
+    # 4. 找 Group A 原始用戶：買過目標商品的用戶 raw ID
+    target_item_id = 3080
+    #mask_A = target_train_edge_index[1] == target_item_id
+    group_A_raw_user_ids = [50, 98, 118, 191, 260, 550, 735, 947, 1175, 1615]#target_train_edge_index[0][mask_A].cpu()
+    print(f"Group A raw user IDs count: {len(group_A_raw_user_ids)}")
+    print(f"Group A raw user IDs sample: {group_A_raw_user_ids}") 
+
+
+    # 5. 篩選 Group A，只保留在 overlap_users 內的有效 raw user id
+    group_A_valid_mask = torch.tensor([uid in overlap_users_set for uid in group_A_raw_user_ids])
+    group_A_raw_user_ids_valid = [uid for uid, valid in zip(group_A_raw_user_ids, group_A_valid_mask) if valid]
+
+    # 6. 映射 Group A 原始用戶 ID 到 embedding 索引
+    group_A_user_emb_idx = torch.tensor([user_id_to_emb_idx[uid] for uid in group_A_raw_user_ids_valid])
+
+    # 7. 對所有 raw 用戶，篩選只包含 overlap_users 的有效用戶，再映射成 embedding 索引
+    valid_all_mask = torch.tensor([uid in overlap_users_set for uid in all_raw_user_ids])
+    valid_all_raw_user_ids = all_raw_user_ids[valid_all_mask]
+    all_user_emb_idx = torch.tensor([user_id_to_emb_idx[uid] for uid in valid_all_raw_user_ids])
+
+    # 8. Group B 即所有有效用戶剔除 Group A，用 embedding 索引形式表示
+    group_B_mask = ~torch.isin(all_user_emb_idx, group_A_user_emb_idx)
+    group_B_user_emb_idx = all_user_emb_idx[group_B_mask]
+
+    # 列印資訊確認
+    logging.info(f"Group A user count: {len(group_A_user_emb_idx)}")
+    logging.info(f"Group B user count: {len(group_B_user_emb_idx)}")
+    # logging.info(f"Group A sample embedding idx: {group_A_user_emb_idx[:10].tolist()}")
+    # logging.info(f"Group B sample embedding idx: {group_B_user_emb_idx[:10].tolist()}")
+
+    # 9. 你可以用 group_A_user_emb_idx 和 group_B_user_emb_idx 這兩組embedding索引去索引 model.user_embedding.weight 做後續計算
+    source_user_embs = model.user_embedding.weight  # shape [num_users, emb_dim]
+
+    # 計算距離與找 hard user 等後續步驟...
+    # 找出hard user
+    hard_user_ids = find_hard_users(source_user_embs, group_A_user_emb_idx.to(source_user_embs.device), top_ratio=0.1)
+    
+    #emb_userID to org_userID
+    emb_idx_to_user_id = {v: k for k, v in user_id_to_emb_idx.items()}
+    hard_user_raw_ids = [emb_idx_to_user_id[idx.item()] for idx in hard_user_ids.cpu()]
+    hard_user_raw_ids.sort()
+    print(f"用戶原始ID（排序後）：{hard_user_raw_ids}")
+    #print(f"找到 hard user 數量: {len(hard_user_ids)}")
+    #print(f"示例 hard user id: {hard_user_ids.tolist()}")#這是emb_userID
+    
+    ###################################
+    
+    # 確保 device 一致
+    device = target_train_edge_index.device
+
+    # 1. 將 hard user 原始ID轉 tensor
+    hard_user_raw_ids_tensor = torch.tensor(hard_user_raw_ids, dtype=torch.long, device=device)
+
+    # # # 2. 建立目標item id tensor (全填 target_item_id)
+    target_item_ids_tensor = torch.full_like(hard_user_raw_ids_tensor, fill_value=target_item_id)
+
+    # # # 3. 將用戶和商品合併成邊索引矩陣
+    new_edges = torch.stack([hard_user_raw_ids_tensor, target_item_ids_tensor], dim=0)
+
+    # # # 4. 合併新邊到 target train edge index
+    target_train_edge_index = torch.cat([target_train_edge_index, new_edges], dim=1)
+
+    # # # 5. 同步合併標籤 (全部1 = 正例)
+    new_labels = torch.ones(hard_user_raw_ids_tensor.size(0), dtype=target_train_label.dtype, device=device)
+    target_train_label = torch.cat([target_train_label, new_labels], dim=0)
+    
+    # 在這裡加上你要印的確認資訊
+    print(f"原始train edge count: {target_train_edge_index.shape[1] - new_edges.shape[1]}")  # 新增前邊數63882
+    print(f"新增後train edge count: {target_train_edge_index.shape[1]}")  # 新增後邊數64162
+    
+    ##################################
+    # 在 source domain 新增 hard user 與熱門商品的邊
+    ##################################
+    # 你已拿到 hard_user_raw_ids 與 group_A_raw_user_ids，接下來先找 group B 用戶
+    group_B_raw_user_ids = list(set(overlap_users.tolist()) - set(group_A_raw_user_ids))
+    #print(group_B_raw_user_ids)
+    
+    #top_diff_items = find_top_diff_items(group_A_raw_user_ids, group_B_raw_user_ids, source_edge_index, top_k=10)
+    top_ratio = 0.0001  # 取前__%差距最大的商品
+    top_diff_items_percentile = find_top_diff_items_by_percentile(
+        group_A_raw_user_ids,
+        group_B_raw_user_ids,
+        source_edge_index,
+        top_ratio=top_ratio,
+    )
+
+
+    # 將 hard users 與 top_diff_items 做配對新增邊 (Cartesian Product)
+    hard_user_raw_ids_tensor_source = torch.tensor(hard_user_raw_ids, device=device)
+    #top_items_tensor = torch.tensor(top_diff_items, device=device)
+    top_items_tensor = torch.tensor(top_diff_items_percentile, device=device)
+
+    # 將用戶和商品配對成邊
+    user_expanded = hard_user_raw_ids_tensor_source.unsqueeze(1).repeat(1, top_items_tensor.size(0)).reshape(-1)
+    item_expanded = top_items_tensor.repeat(hard_user_raw_ids_tensor_source.size(0))
+
+    new_source_edges = torch.stack([user_expanded, item_expanded], dim=0)
+
+    # 新增邊及標籤到 source_edge_index
+    source_edge_index = torch.cat([source_edge_index.to(device), new_source_edges], dim=1)
+
+    # source domain標籤統一為1（新增為正例）
+    new_source_labels = torch.ones(user_expanded.size(0), dtype=torch.long, device=device)
+
+    # 假設你有 source_label 需同時合併標籤
+    source_label = torch.cat([source_label.to(device), new_source_labels], dim=0)
+
+    print(f"Source 邊數從 {source_edge_index.shape[1] - new_source_edges.shape[1]} 新增至 {source_edge_index.shape[1]}")
+    print(f"Source 標籤從 {source_label.size(0) - new_source_labels.size(0)} 新增至 {source_label.size(0)}")
+
+    ### 新增source domain的邊結束 ###
+    
+    ###################################
 
     target_train_set = Dataset(
         target_train_link.to("cpu"),
@@ -541,8 +852,8 @@ def train(model, perceptor, data, args):
         num_candidates=99,
         device=device,
     )
-    # cold_item_id = find_cold_item_strict(data, target_train_edge_index, target_test_edge_index)
-    cold_item_id =17069
+    #cold_item_id = find_cold_item_strict(data, target_train_edge_index, target_test_edge_index)
+    cold_item_id = 3080
     if cold_item_id is not None:
         evaluate_er_hit_ratio(
             model=model,
