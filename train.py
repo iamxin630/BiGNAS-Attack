@@ -1,4 +1,4 @@
-###這是方法二###
+###這是方法二####
 import logging
 
 import torch
